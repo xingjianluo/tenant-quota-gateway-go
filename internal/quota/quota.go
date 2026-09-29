@@ -167,3 +167,133 @@ func (l *Limiter) Usage(tenantID string) Usage {
 		QuotaRemain: remain,
 	}
 }
+
+// SavedState 是单个租户计数器的可持久化形态（由持久化层负责序列化）。
+type SavedState struct {
+	Tokens   float64
+	LastFill time.Time
+	InFlight int
+	Used     int64
+}
+
+// SnapshotAll 导出当前所有已惰性创建的租户计数器副本，用于写入检查点。
+func (l *Limiter) SnapshotAll() map[string]SavedState {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make(map[string]SavedState, len(l.states))
+	for id, st := range l.states {
+		out[id] = SavedState{Tokens: st.tokens, LastFill: st.lastFill, InFlight: st.inFlight, Used: st.used}
+	}
+	return out
+}
+
+// RestoreAll 用检查点状态整体替换各租户计数器。
+// 必须在配置好全部 Limit 之后、且在处理任何请求之前调用。
+func (l *Limiter) RestoreAll(states map[string]SavedState) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.states = make(map[string]*tenantState, len(states))
+	for id, s := range states {
+		l.states[id] = &tenantState{tokens: s.Tokens, lastFill: s.LastFill, inFlight: s.InFlight, used: s.Used}
+	}
+}
+
+// SettleInFlight 恢复时把崩溃前在途请求占用的并发槽释放，并按实际在途数归还预扣配额。
+// 每个崩溃在途请求：占槽 1 个、配额 +1（已提交的成功结论对应的扣减不受影响）。
+func (l *Limiter) SettleInFlight(tenantID string, inflight int) {
+	if inflight <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lim, ok := l.limits[tenantID]
+	if !ok {
+		lim = Limit{}
+	}
+	st, ok := l.states[tenantID]
+	if !ok {
+		return
+	}
+	if inflight > st.inFlight {
+		inflight = st.inFlight
+	}
+	st.inFlight -= inflight
+	st.used -= int64(inflight)
+	if st.used < 0 {
+		st.used = 0
+	}
+	for i := 0; i < inflight; i++ {
+		if st.tokens < float64(lim.Burst) {
+			st.tokens++
+		}
+	}
+}
+
+// Finish 汇总一次请求执行结束后的结算动作，在单把锁内原子完成并返回结算后状态：
+// execOK=true  -> 仅释放并发槽（预扣配额保留为已成功用量）；
+// execOK=false -> 释放并发槽并归还预扣配额与速率令牌。
+// 与分开调用 Release/Refund/Usage 相比，返回的状态不会被并发请求穿插改写，
+// 因此持久化的"最终配额"与内存状态严格一致。
+func (l *Limiter) Finish(tenantID string, execOK bool) (Usage, SavedState) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lim, ok := l.limits[tenantID]
+	if !ok {
+		lim = Limit{}
+	}
+	st, exists := l.states[tenantID]
+	if !exists {
+		st = l.state(tenantID, lim, l.clock.Now())
+	}
+	if st.inFlight > 0 {
+		st.inFlight--
+	}
+	if !execOK {
+		if st.used > 0 {
+			st.used--
+		}
+		if st.tokens < float64(lim.Burst) {
+			st.tokens++
+		}
+	}
+	remain := int64(0)
+	if lim.TotalQuota > 0 {
+		remain = lim.TotalQuota - st.used
+		if remain < 0 {
+			remain = 0
+		}
+	}
+	u := Usage{Tokens: st.tokens, InFlight: st.inFlight, QuotaUsed: st.used, QuotaRemain: remain}
+	saved := SavedState{Tokens: st.tokens, LastFill: st.lastFill, InFlight: st.inFlight, Used: st.used}
+	return u, saved
+}
+
+// Peek 在单把锁内返回当前 Usage 快照与计数器副本（拒绝路径持久化用，
+// 保证事件携带的 Usage 与计数器状态严格一致、不被并发穿插）。
+func (l *Limiter) Peek(tenantID string) (Usage, SavedState) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	lim, ok := l.limits[tenantID]
+	if !ok {
+		lim = Limit{}
+	}
+	now := l.clock.Now()
+	st := l.state(tenantID, lim, now)
+	l.refill(st, lim, now)
+	remain := int64(0)
+	if lim.TotalQuota > 0 {
+		remain = lim.TotalQuota - st.used
+		if remain < 0 {
+			remain = 0
+		}
+	}
+	return Usage{Tokens: st.tokens, InFlight: st.inFlight, QuotaUsed: st.used, QuotaRemain: remain},
+		SavedState{Tokens: st.tokens, LastFill: st.lastFill, InFlight: st.inFlight, Used: st.used}
+}
+
+// RestoreTenant 用单个租户的计数器快照替换其状态（重放提交事件时逐事件推进用）。
+func (l *Limiter) RestoreTenant(tenantID string, s SavedState) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.states[tenantID] = &tenantState{tokens: s.Tokens, lastFill: s.LastFill, inFlight: s.InFlight, used: s.Used}
+}

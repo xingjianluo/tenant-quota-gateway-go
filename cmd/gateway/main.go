@@ -1,8 +1,9 @@
-// Command gateway 在本地演示多租户准入网关：鉴权、限流、配额扣减与审计流水。
+// Command gateway 在本地演示多租户准入网关：鉴权、限流、配额扣减、审计流水与重启恢复。
 package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -12,12 +13,23 @@ import (
 	"github.com/xingjianluo/tenant-quota-gateway-go/internal/auth"
 	"github.com/xingjianluo/tenant-quota-gateway-go/internal/clock"
 	"github.com/xingjianluo/tenant-quota-gateway-go/internal/gateway"
+	"github.com/xingjianluo/tenant-quota-gateway-go/internal/persist"
 	"github.com/xingjianluo/tenant-quota-gateway-go/internal/quota"
 )
 
 func main() {
+	stateDir := flag.String("state", "./.gateway-state", "持久化状态目录（快照 + 提交日志）；留空则纯内存运行")
+	reset := flag.Bool("reset", false, "启动前清空状态目录（从头演示）")
+	flag.Parse()
+
 	logger := log.New(os.Stdout, "[gateway] ", log.LstdFlags)
 	clk := clock.Real{}
+
+	if *reset && *stateDir != "" {
+		if err := os.RemoveAll(*stateDir); err != nil {
+			log.Fatalf("reset state: %v", err)
+		}
+	}
 
 	// 令牌仓库：两个租户，各持一个令牌。
 	store := auth.NewStore()
@@ -32,6 +44,18 @@ func main() {
 	gw := gateway.New(auth.NewAuthenticator(store, clk), limiter, clk,
 		func(ctx context.Context, req gateway.Request) error { return nil })
 	gw.Logger = logger
+
+	// 接入本地持久化：结论先落盘再返回，重启后配额、幂等结论与审计接着延续。
+	if *stateDir != "" {
+		ps, err := persist.NewFileStore(*stateDir)
+		if err != nil {
+			log.Fatalf("open state store: %v", err)
+		}
+		if err := gw.AttachStore(ps, 4096, 256); err != nil {
+			log.Fatalf("restore state: %v", err)
+		}
+		logger.Printf("state restored from %s", *stateDir)
+	}
 
 	ctx := context.Background()
 
@@ -69,4 +93,7 @@ func main() {
 	}
 	fmt.Printf("alpha 最终用量: %+v\n", limiter.Usage("alpha"))
 	fmt.Printf("beta  最终用量: %+v\n", limiter.Usage("beta"))
+	if *stateDir != "" {
+		fmt.Printf("\n状态已持久化到 %s；再次运行（不带 -reset）可观察重启恢复：同一批请求将全部判 DUPLICATE，用量不变。\n", *stateDir)
+	}
 }
