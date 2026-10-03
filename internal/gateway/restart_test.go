@@ -198,44 +198,55 @@ type crashEnv struct {
 	release chan struct{}
 	entered chan struct{}
 	hang    map[string]bool // 只有这些 RequestID 的下游会阻塞
+	limit   quota.Limit
 }
 
+// 默认崩溃环境配额：并发 4 槽、总量 5。
+var defaultCrashLimit = quota.Limit{RatePerSec: 1000, Burst: 1000, MaxConcurrent: 4, TotalQuota: 5}
+
 func newCrashEnv(t *testing.T) *crashEnv {
+	return newCrashEnvWithLimit(t, defaultCrashLimit)
+}
+
+func newCrashEnvWithLimit(t *testing.T, lim quota.Limit) *crashEnv {
 	dir := t.TempDir()
 	env := &crashEnv{
 		t: t, dir: dir, c: clock.NewFake(t0),
-		release: make(chan struct{}), entered: make(chan struct{}, 16),
-		hang: map[string]bool{},
+		hang:  map[string]bool{},
+		limit: lim,
 	}
 	env.boot(true)
 	return env
 }
 
 // boot 拉起一个新进程；crashStore 只包在"会崩溃的旧进程"外，重启后的进程直接用文件存储。
+// 每次以 asCrash 拉起都换一组新的阻塞/放行通道，句柄在闭包内固化，
+// 上一轮崩溃残留的 goroutine 不会误触新一轮通道。
 func (e *crashEnv) boot(asCrash bool) {
 	store, err := persist.NewFileStore(filepath.Join(e.dir, "state"))
 	if err != nil {
 		e.t.Fatalf("open store: %v", err)
 	}
 	var attached persist.Store = store
+	h := okHandler
 	if asCrash {
 		e.crashed = newCrashStore(store)
 		attached = e.crashed
-	}
-	e.limiter = quota.NewLimiter(e.c)
-	e.limiter.SetLimit("tenant-a", quota.Limit{RatePerSec: 1000, Burst: 1000, MaxConcurrent: 4, TotalQuota: 5})
-	s := auth.NewStore()
-	s.Put(auth.Token{ID: "tok-a", TenantID: "tenant-a", Scopes: []string{"invoke"}, ExpiresAt: t0.Add(24 * time.Hour)})
-	h := okHandler
-	if asCrash {
+		e.release = make(chan struct{})
+		e.entered = make(chan struct{}, 16)
+		release, entered := e.release, e.entered
 		h = func(_ context.Context, r Request) error {
 			if e.hang[r.RequestID] {
-				e.entered <- struct{}{}
-				<-e.release
+				entered <- struct{}{}
+				<-release
 			}
 			return nil
 		}
 	}
+	e.limiter = quota.NewLimiter(e.c)
+	e.limiter.SetLimit("tenant-a", e.limit)
+	s := auth.NewStore()
+	s.Put(auth.Token{ID: "tok-a", TenantID: "tenant-a", Scopes: []string{"invoke"}, ExpiresAt: t0.Add(24 * time.Hour)})
 	e.gw = New(auth.NewAuthenticator(s, e.c), e.limiter, e.c, h)
 	e.gw.Logger = log.New(io.Discard, "", 0)
 	if err := e.gw.AttachStore(attached, 4096, 256); err != nil {

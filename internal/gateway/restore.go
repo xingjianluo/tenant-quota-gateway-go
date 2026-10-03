@@ -42,7 +42,6 @@ func (g *Gateway) restore() error {
 	// 因此先收集每个租户的"最后状态"，重放完一次性应用。
 	waterline := g.seq
 	finalStates := map[string]quota.SavedState{}
-	inflight := map[string]int{}
 	replayed := 0
 	for _, e := range events {
 		if e.Seq <= waterline {
@@ -55,9 +54,6 @@ func (g *Gateway) restore() error {
 				finalStates[e.TenantID] = quota.SavedState{
 					Tokens: e.State.Tokens, LastFill: e.State.LastFill,
 					InFlight: e.State.InFlight, Used: e.State.Used,
-				}
-				if e.TenantID != "" {
-					inflight[e.TenantID] = e.State.InFlight
 				}
 			}
 			g.lastCommit[e.RequestID] = e
@@ -78,10 +74,17 @@ func (g *Gateway) restore() error {
 		g.limiter.RestoreTenant(tenant, st)
 	}
 
-	// 崩溃在途结算：最后一个已提交状态里的 InFlight 即崩溃瞬间仍占用的槽位数。
-	// （Acquire 已记账但结论未提交的请求没有任何事件，按"未发生"由下式自动修正。）
-	for tenant, n := range inflight {
-		g.limiter.SettleInFlight(tenant, n)
+	// 崩溃在途结算：恢复出的最终状态里仍标记 InFlight>0 的槽位，都属于
+	// "崩溃瞬间还在执行、结论未提交"的请求（已提交的结论会把自己的最终状态
+	// 写进日志/快照并覆盖旧值）。无论该状态来自快照（检查点时刻有请求在途，
+	// 之后没来得及再提交就崩溃）还是日志最后一条提交事件，统一按"未发生"
+	// 回滚：释放并发槽、归还预扣配额与速率令牌。
+	// 结算只作用于本次从磁盘重建出来的状态，不落盘；即使刚恢复又崩溃，
+	// 下次重启仍从同一份磁盘状态重做一次同样的结算，结果一致、不会重复退款。
+	for tenant, st := range g.limiter.SnapshotAll() {
+		if st.InFlight > 0 {
+			g.limiter.SettleInFlight(tenant, st.InFlight)
+		}
 	}
 	if replayed > 0 {
 		g.eventsSinceSnapshot = replayed
