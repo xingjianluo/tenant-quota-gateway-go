@@ -43,6 +43,16 @@ func (g *Gateway) restore() error {
 	waterline := g.seq
 	finalStates := map[string]quota.SavedState{}
 	inflight := map[string]int{}
+	// 快照本身也是一份"最后已提交状态"：检查点时刻仍在途、之后再无提交事件的请求，
+	// 其并发槽与预扣配额会随快照原样恢复，必须纳入崩溃在途结算。
+	// 日志中更新的提交事件会覆盖这里的初值（见下）。
+	if snap != nil {
+		for id, st := range snap.Tenants {
+			if st.InFlight > 0 {
+				inflight[id] = st.InFlight
+			}
+		}
+	}
 	replayed := 0
 	for _, e := range events {
 		if e.Seq <= waterline {
@@ -78,13 +88,24 @@ func (g *Gateway) restore() error {
 		g.limiter.RestoreTenant(tenant, st)
 	}
 
-	// 崩溃在途结算：最后一个已提交状态里的 InFlight 即崩溃瞬间仍占用的槽位数。
-	// （Acquire 已记账但结论未提交的请求没有任何事件，按"未发生"由下式自动修正。）
+	// 崩溃在途结算：最后一个已提交状态（快照或日志事件）里的 InFlight 即崩溃瞬间
+	// 仍占用的槽位数。（Acquire 已记账但结论未提交的请求没有任何事件，按"未发生"
+	// 由下式自动修正：释放槽位、归还预扣配额与速率令牌；已提交结论的扣减不受影响。）
+	settled := 0
 	for tenant, n := range inflight {
+		if n > 0 {
+			settled += n
+		}
 		g.limiter.SettleInFlight(tenant, n)
 	}
 	if replayed > 0 {
 		g.eventsSinceSnapshot = replayed
+	}
+	// 回滚结果立即落盘为检查点（快照 + 截断日志），使"按未发生处理"只生效一次：
+	// 此后无论再崩多少次、重启多少回，恢复出的都是已结算状态，不会重复退款。
+	// 此处仍在 AttachStore 内、尚未对外服务，无并发，可直接走 checkpointLocked。
+	if settled > 0 {
+		g.checkpointLocked()
 	}
 	return nil
 }

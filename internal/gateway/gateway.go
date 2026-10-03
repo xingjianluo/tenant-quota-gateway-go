@@ -156,7 +156,8 @@ func (g *Gateway) admitOnce(ctx context.Context, req Request) (Decision, *quota.
 
 	// 3. 执行下游调用；锁内原子结算（释放槽位，失败归还配额），
 	// 返回的 Usage 与计数器状态严格一致，直接用于审计与持久化。
-	execOK := g.handler(ctx, req) == nil
+	execErr := g.handler(ctx, req)
+	execOK := execErr == nil
 	u, st := g.limiter.Finish(id.TenantID, execOK)
 	dec.Usage = u
 	if execOK {
@@ -164,7 +165,8 @@ func (g *Gateway) admitOnce(ctx context.Context, req Request) (Decision, *quota.
 		dec.Reason = "ok"
 	} else {
 		dec.Code = CodeExecFailed
-		dec.Reason = "downstream execution failed"
+		// 判定依据原样保留下游真实错误，便于审计时定位失败原因。
+		dec.Reason = "downstream execution failed: " + execErr.Error()
 	}
 	return dec, &st
 }
